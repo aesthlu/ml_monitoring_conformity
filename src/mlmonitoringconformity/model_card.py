@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 
 _SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
@@ -117,7 +117,7 @@ def generate_model_card(info: ModelInfo, generated_on: date | None = None) -> st
             "aucune model card ne peut être générée."
         )
 
-    day = generated_on or date.today()
+    day = generated_on or datetime.now(timezone.utc).date()
 
     sections = [
         f"# Model Card — {info.name} v{info.version}",
