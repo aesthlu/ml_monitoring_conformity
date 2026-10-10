@@ -1,57 +1,117 @@
-import numpy as np
+"""Mesures de dérive (drift) entre une distribution de référence et une distribution courante."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
+from enum import Enum
+
+import numpy as np
+import numpy.typing as npt
+from scipy import stats  # type: ignore[import-untyped]
+
+FloatArray = npt.NDArray[np.float64]
+
+_EPSILON = 1e-6
+PSI_WARNING_THRESHOLD = 0.1
+PSI_DRIFT_THRESHOLD = 0.25
 
 
-@dataclass
+class DriftLevel(str, Enum):
+    """Interprétation usuelle d'une valeur de PSI."""
+
+    STABLE = "stable"
+    WARNING = "à surveiller"
+    DRIFT = "dérive"
+
+
+@dataclass(frozen=True)
 class DriftResult:
+    """Résultat d'un test de dérive statistique."""
+
     statistic: float
     p_value: float
-    drift_detected: bool
+    drift: bool
 
 
-def psi(reference, current, bins=10) -> float:
-    """
-    Calculate the Population Stability Index (PSI) between two distributions.
+def _to_array(values: npt.ArrayLike, name: str) -> FloatArray:
+    """Convertit une entrée en tableau 1D de flottants, non vide et sans NaN."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"{name} doit être un tableau à une dimension.")
+    if array.size == 0:
+        raise ValueError(f"{name} ne peut pas être vide.")
+    if np.isnan(array).any():
+        raise ValueError(f"{name} contient des valeurs manquantes (NaN).")
+    return array
 
-    Parameters:
-    reference (array-like): The reference distribution (e.g., historical data).
-    current (array-like): The current distribution (e.g., new data).
-    bins (int): The number of bins to use for the histogram.
 
-    Returns:
-    float: The PSI value.
-    """
-    # Create histograms for both distributions
-    ref_hist, bin_edges = np.histogram(reference, bins=bins, density=True)
-    curr_hist, _ = np.histogram(current, bins=bin_edges, density=True)
+def psi(reference: npt.ArrayLike, current: npt.ArrayLike, bins: int = 10) -> float:
+    """Calcule le Population Stability Index entre deux distributions.
 
-    # Avoid division by zero and log of zero by adding a small constant
-    ref_hist = np.where(ref_hist == 0, 1e-10, ref_hist)
-    curr_hist = np.where(curr_hist == 0, 1e-10, curr_hist)
+    Les intervalles sont construits sur les quantiles de la distribution de
+    référence. Un epsilon évite les divisions par zéro et les log(0) quand un
+    intervalle est vide.
 
-    # Calculate PSI
-    psi_value = np.sum((curr_hist - ref_hist) * np.log(curr_hist / ref_hist))
-
-    return psi_value
-
-def ks_drift(reference, current, alpha=0.05) -> DriftResult:
-    """
-    Perform the Kolmogorov-Smirnov test to detect drift between two distributions.
-
-    Parameters:
-    reference (array-like): The reference distribution (e.g., historical data).
-    current (array-like): The current distribution (e.g., new data).
-    alpha (float): Significance level for the test.
+    Args:
+        reference: Valeurs de la période de référence (ex. données d'entraînement).
+        current: Valeurs de la période courante (ex. données de production).
+        bins: Nombre d'intervalles, au moins 2.
 
     Returns:
-    DriftResult: A dataclass containing the KS statistic, p-value, and drift detection result.
+        La valeur du PSI, positive ou nulle.
     """
-    from scipy.stats import ks_2samp
+    if bins < 2:
+        raise ValueError("bins doit être supérieur ou égal à 2.")
+    ref = _to_array(reference, "reference")
+    cur = _to_array(current, "current")
 
-    statistic, p_value = ks_2samp(reference, current)
-    drift_detected = p_value < alpha
+    quantiles = np.linspace(0, 1, bins + 1)[1:-1]
+    inner_edges = np.unique(np.quantile(ref, quantiles))
 
-    return DriftResult(statistic=statistic, p_value=p_value, drift_detected=drift_detected)
+    ref_counts = np.bincount(
+        np.searchsorted(inner_edges, ref, side="right"), minlength=inner_edges.size + 1
+    )
+    cur_counts = np.bincount(
+        np.searchsorted(inner_edges, cur, side="right"), minlength=inner_edges.size + 1
+    )
+
+    ref_share = np.clip(ref_counts / ref.size, _EPSILON, None)
+    cur_share = np.clip(cur_counts / cur.size, _EPSILON, None)
+
+    return float(np.sum((cur_share - ref_share) * np.log(cur_share / ref_share)))
 
 
+def interpret_psi(value: float) -> DriftLevel:
+    """Traduit une valeur de PSI en niveau de dérive selon les seuils usuels."""
+    if value < 0:
+        raise ValueError("Un PSI ne peut pas être négatif.")
+    if value < PSI_WARNING_THRESHOLD:
+        return DriftLevel.STABLE
+    if value < PSI_DRIFT_THRESHOLD:
+        return DriftLevel.WARNING
+    return DriftLevel.DRIFT
 
+
+def ks_drift(
+    reference: npt.ArrayLike, current: npt.ArrayLike, alpha: float = 0.05
+) -> DriftResult:
+    """Détecte une dérive avec le test de Kolmogorov-Smirnov à deux échantillons.
+
+    Args:
+        reference: Valeurs de la période de référence.
+        current: Valeurs de la période courante.
+        alpha: Seuil de significativité, strictement entre 0 et 1.
+
+    Returns:
+        La statistique KS, la p-value et un booléen indiquant une dérive.
+    """
+    if not 0 < alpha < 1:
+        raise ValueError("alpha doit être strictement compris entre 0 et 1.")
+    ref = _to_array(reference, "reference")
+    cur = _to_array(current, "current")
+
+    result = stats.ks_2samp(ref, cur)
+    p_value = float(result.pvalue)
+    return DriftResult(
+        statistic=float(result.statistic), p_value=p_value, drift=p_value < alpha
+    )
